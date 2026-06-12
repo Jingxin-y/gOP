@@ -25,7 +25,12 @@ dataGOP <- simulate_gop_dgm_getTwo(n = 1000,measures = c("RR", "OR", "OR"),f0 = 
                         design = c("factorial"),pi0 = 0.5,pi1 = 0.5,
                         randomized = TRUE,eps = 1e-8)
 
-
+dataRBC <- simulate_rbc_dgm(n = 1000,f0 = ~ 1,
+                                   f1 = ~ 1,f2 = ~ 1,f3 = ~ 1 + z1 + z2 + z3,
+                                   b0.true = c(0.15),b1.true = c(0.20),
+                                   b2.true = c(0.25),b3.true = c(-6.00,  0.35, -0.20, 0.15),
+                                   design = c("factorial"),pi0 = 0.5,pi1 = 0.5,
+                                   randomized = TRUE,eps = 1e-8)
 
 ##estimate by RBC model
 
@@ -56,6 +61,7 @@ for(r in 1000){
   
   result_gOP <- evalu_gOP_CM(fit_gOP)
   
-  result <- list(rbc = result_rbc,
+  result <- list(cell_true = cbind(d1$p00,d1$p10,d1$p01,d1$p11),
+                 rbc = result_rbc,
                  gOP = result_gOP)
 }

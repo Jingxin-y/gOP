@@ -1,0 +1,558 @@
+---
+title: "Simulation Cell Probability Results"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+params:
+  result_dir: "simulation_output_parallel_rbc"
+  file_filter: ""
+  recursive: false
+  plot_sample_per_group: 3000
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+```{r functions}
+input_file <- knitr::current_input()
+rmd_dir <- if (!is.null(input_file)) {
+  dirname(normalizePath(input_file, winslash = "/", mustWork = TRUE))
+} else {
+  normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+}
+
+result_dir <- params$result_dir
+if (!dir.exists(result_dir)) {
+  result_dir <- file.path(rmd_dir, params$result_dir)
+}
+result_dir <- normalizePath(result_dir, winslash = "/", mustWork = TRUE)
+
+cells <- c("p00", "p10", "p01", "p11")
+base_method_order <- c("gOP", "RBC")
+base_method_cell_order <- as.vector(outer(base_method_order, cells, paste, sep = "_"))
+error_ylim <- c(-0.4, 0.4)
+
+read_cell_csv <- function(file) {
+  read.csv(file, check.names = FALSE)
+}
+
+get_first_value <- function(x, default = NA) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(default)
+  x[1]
+}
+
+guess_n_from_file <- function(file) {
+  base <- basename(file)
+  m <- regexpr("n_?[0-9]+", base)
+  if (m < 0) m <- regexpr("_[0-9]+", base)
+  if (m < 0) return(NA_integer_)
+  as.integer(gsub("[^0-9]", "", regmatches(base, m)))
+}
+
+guess_scenario_from_file <- function(file) {
+  base <- sub("\\.csv$", "", basename(file))
+  base <- sub("^cell_probability_results_?", "", base)
+  base <- sub("^cell_probability_true_values_?", "", base)
+  if (!nzchar(base)) "default" else base
+}
+
+guess_param_set_from_scenario <- function(scenario) {
+  out <- scenario
+  out <- sub("^rbc_dgm_", "", out)
+  out <- sub("^n_?[0-9]+_?", "", out)
+  out <- sub("^[0-9]+_?", "", out)
+  out <- gsub("(small|normal)([0-9]+)$", "\\1_\\2", out)
+  ifelse(grepl("[A-Za-z]", out), out, NA_character_)
+}
+
+guess_dgm_from_file <- function(file) {
+  if (grepl("rbc_dgm", basename(file), ignore.case = TRUE)) {
+    "RBC-DGM"
+  } else {
+    "gOP-DGM"
+  }
+}
+
+add_missing_metadata <- function(df, file) {
+  scenario <- guess_scenario_from_file(file)
+
+  if (!"scenario" %in% names(df)) df$scenario <- scenario
+  if (!"dgm" %in% names(df)) df$dgm <- guess_dgm_from_file(file)
+  if (!"param_set" %in% names(df)) {
+    df$param_set <- guess_param_set_from_scenario(get_first_value(df$scenario, scenario))
+  }
+  if (!"n" %in% names(df)) df$n <- guess_n_from_file(file)
+
+  for (cell in cells) df[[cell]] <- as.numeric(df[[cell]])
+  df
+}
+
+truth_file_for <- function(estimate_file, all_truth_files) {
+  target_name <- sub(
+    "^cell_probability_results",
+    "cell_probability_true_values",
+    basename(estimate_file)
+  )
+  same_dir <- file.path(dirname(estimate_file), target_name)
+  if (file.exists(same_dir)) return(same_dir)
+
+  hit <- all_truth_files[basename(all_truth_files) == target_name]
+  if (length(hit) > 0) return(hit[1])
+
+  NA_character_
+}
+
+make_method_cell_order <- function(methods) {
+  known <- intersect(base_method_order, methods)
+  extra <- setdiff(sort(methods), known)
+  as.vector(outer(c(known, extra), cells, paste, sep = "_"))
+}
+
+safe_sample <- function(idx, n) {
+  if (!is.finite(n) || length(idx) <= n) return(idx)
+  sample(idx, n)
+}
+
+summarize_one_file <- function(estimate_file, truth_file, sample_per_group) {
+  estimate <- add_missing_metadata(read_cell_csv(estimate_file), estimate_file)
+  truth <- add_missing_metadata(read_cell_csv(truth_file), truth_file)
+
+  key_candidates <- c("scenario", "dgm", "param_set", "n", "sim_id", "seed", "id")
+  keys <- key_candidates[key_candidates %in% names(estimate) &
+                           key_candidates %in% names(truth)]
+
+  truth_keep <- unique(c(keys, cells))
+  truth <- truth[, truth_keep, drop = FALSE]
+  truth <- truth[!duplicated(truth[, keys, drop = FALSE]), , drop = FALSE]
+  names(truth)[match(cells, names(truth))] <- paste0(cells, "_true")
+
+  merged <- merge(estimate, truth, by = keys, all.x = TRUE, sort = FALSE)
+  methods <- sort(unique(merged$method))
+  method_cell_order <- make_method_cell_order(methods)
+
+  summary_rows <- list()
+  plot_rows <- list()
+  row_id <- 1L
+
+  for (cell in cells) {
+    true_col <- paste0(cell, "_true")
+
+    for (method in methods) {
+      valid_idx <- which(
+        merged$method == method &
+          is.finite(merged[[cell]]) &
+          is.finite(merged[[true_col]])
+      )
+      n_zero_excluded <- sum(
+        merged[[cell]][valid_idx] <= 0 | merged[[true_col]][valid_idx] <= 0,
+        na.rm = TRUE
+      )
+      idx <- valid_idx[
+        merged[[cell]][valid_idx] > 0 &
+          merged[[true_col]][valid_idx] > 0
+      ]
+      if (length(idx) == 0) next
+
+      estimate_value <- merged[[cell]][idx]
+      true_value <- merged[[true_col]][idx]
+      error <- estimate_value - true_value
+      abs_error <- abs(error)
+
+      method_cell <- paste(method, cell, sep = "_")
+
+      summary_rows[[row_id]] <- data.frame(
+        scenario = get_first_value(merged$scenario, guess_scenario_from_file(estimate_file)),
+        dgm = get_first_value(merged$dgm, guess_dgm_from_file(estimate_file)),
+        param_set = get_first_value(merged$param_set, NA_character_),
+        n = get_first_value(merged$n, guess_n_from_file(estimate_file)),
+        file = basename(estimate_file),
+        method = method,
+        cell = cell,
+        method_cell = method_cell,
+        n_total = length(valid_idx),
+        n_zero_excluded = n_zero_excluded,
+        n_values = length(idx),
+        mean_true = mean(true_value, na.rm = TRUE),
+        mean_est = mean(estimate_value, na.rm = TRUE),
+        bias = mean(error, na.rm = TRUE),
+        abs_bias = abs(mean(error, na.rm = TRUE)),
+        mae = mean(abs_error, na.rm = TRUE),
+        rmse = sqrt(mean(error^2, na.rm = TRUE)),
+        mcsd_error = sd(error, na.rm = TRUE),
+        q025_error = unname(quantile(error, 0.025, na.rm = TRUE)),
+        q500_error = unname(quantile(error, 0.500, na.rm = TRUE)),
+        q975_error = unname(quantile(error, 0.975, na.rm = TRUE)),
+        n_error_low = sum(error < error_ylim[1], na.rm = TRUE),
+        n_error_high = sum(error > error_ylim[2], na.rm = TRUE),
+        row.names = NULL
+      )
+
+      sampled <- safe_sample(seq_along(idx), sample_per_group)
+      plot_rows[[row_id]] <- data.frame(
+        scenario = summary_rows[[row_id]]$scenario,
+        dgm = summary_rows[[row_id]]$dgm,
+        param_set = summary_rows[[row_id]]$param_set,
+        n = summary_rows[[row_id]]$n,
+        method = method,
+        cell = cell,
+        method_cell = method_cell,
+        true = true_value[sampled],
+        estimate = estimate_value[sampled],
+        error = error[sampled],
+        row.names = NULL
+      )
+
+      row_id <- row_id + 1L
+    }
+  }
+
+  summary <- do.call(rbind, summary_rows)
+  plot_data <- do.call(rbind, plot_rows)
+
+  summary$method_cell <- factor(summary$method_cell, levels = method_cell_order)
+  summary$cell <- factor(summary$cell, levels = cells)
+  plot_data$method_cell <- factor(plot_data$method_cell, levels = method_cell_order)
+  plot_data$cell <- factor(plot_data$cell, levels = cells)
+
+  label <- paste0(
+    "n=", get_first_value(summary$n),
+    if (!is.na(get_first_value(summary$param_set, NA_character_))) {
+      paste0(", ", gsub("_", "", get_first_value(summary$param_set)))
+    } else {
+      ""
+    },
+    " (", get_first_value(summary$dgm), ")"
+  )
+
+  list(
+    file = estimate_file,
+    truth_file = truth_file,
+    label = label,
+    summary = summary,
+    plot_data = plot_data
+  )
+}
+
+plot_error_boxplot <- function(result) {
+  plot_data <- result$plot_data
+  summary <- result$summary
+  need_truncate <- any(summary$n_error_low > 0 | summary$n_error_high > 0)
+
+  p <- ggplot(plot_data, aes(x = method_cell, y = error, fill = method)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey35") +
+    geom_boxplot(color = "grey20", width = 0.75, outlier.size = 0.4, alpha = 0.9) +
+    stat_summary(
+      fun = mean,
+      geom = "point",
+      shape = 21,
+      size = 2.2,
+      fill = "white",
+      color = "black"
+    ) +
+    geom_point(
+      data = subset(summary, n_error_high > 0),
+      aes(x = method_cell, y = error_ylim[2], size = n_error_high),
+      inherit.aes = FALSE,
+      shape = 21,
+      fill = "#C1121F",
+      color = "#C1121F",
+      alpha = 0.45
+    ) +
+    geom_text(
+      data = subset(summary, n_error_high > 0),
+      aes(x = method_cell, y = error_ylim[2], label = n_error_high),
+      inherit.aes = FALSE,
+      color = "#1D3557",
+      size = 3.5,
+      vjust = -0.4
+    ) +
+    geom_point(
+      data = subset(summary, n_error_low > 0),
+      aes(x = method_cell, y = error_ylim[1], size = n_error_low),
+      inherit.aes = FALSE,
+      shape = 21,
+      fill = "#C1121F",
+      color = "#C1121F",
+      alpha = 0.45
+    ) +
+    geom_text(
+      data = subset(summary, n_error_low > 0),
+      aes(x = method_cell, y = error_ylim[1], label = n_error_low),
+      inherit.aes = FALSE,
+      color = "#1D3557",
+      size = 3.5,
+      vjust = 1.3
+    ) +
+    scale_fill_manual(values = c(gOP = "#2A9D8F", RBC = "#E76F51")) +
+    scale_size_area(max_size = 16) +
+    guides(size = "none") +
+    theme_minimal(base_size = 15) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    ) +
+    labs(
+      title = paste0("Estimation error of cell probabilities (", result$label, ")"),
+      x = "Method_cell",
+      y = "Estimated probability - true probability",
+      fill = "Method"
+    )
+
+  if (need_truncate) {
+    p <- p + coord_cartesian(ylim = error_ylim, clip = "off")
+  }
+
+  p
+}
+
+plot_estimate_boxplot <- function(result) {
+  ggplot(result$plot_data, aes(x = method_cell, y = estimate, fill = method)) +
+    geom_boxplot(color = "grey20", width = 0.75, outlier.size = 0.4, alpha = 0.9) +
+    stat_summary(
+      fun = mean,
+      geom = "point",
+      shape = 21,
+      size = 2.2,
+      fill = "white",
+      color = "black"
+    ) +
+    scale_fill_manual(values = c(gOP = "#2A9D8F", RBC = "#E76F51")) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_minimal(base_size = 15) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    ) +
+    labs(
+      title = paste0("Estimated cell probabilities (", result$label, ")"),
+      x = "Method_cell",
+      y = "Estimated probability",
+      fill = "Method"
+    )
+}
+
+plot_scatter <- function(result) {
+  ggplot(result$plot_data, aes(x = true, y = estimate, color = method)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey35") +
+    geom_point(alpha = 0.25, size = 0.7) +
+    facet_wrap(~ cell, nrow = 2) +
+    scale_color_manual(values = c(gOP = "#2A9D8F", RBC = "#E76F51")) +
+    coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+    theme_minimal(base_size = 15) +
+    theme(legend.position = "top") +
+    labs(
+      title = paste0("Estimated versus true cell probabilities (", result$label, ")"),
+      x = "True probability",
+      y = "Estimated probability",
+      color = "Method"
+    )
+}
+
+plot_lollipop <- function(result, value, target, title, ylab) {
+  df <- result$summary
+  df$dev <- abs(df[[value]] - target)
+  df$label_y <- ifelse(df[[value]] >= target, df[[value]] + 0.006, df[[value]] - 0.006)
+  df$vjust <- ifelse(df[[value]] >= target, 0, 1)
+
+  ggplot(df, aes(x = method_cell, y = .data[[value]], color = method)) +
+    geom_segment(
+      aes(xend = method_cell, y = target, yend = .data[[value]]),
+      linewidth = 2.2,
+      lineend = "round",
+      alpha = 0.85
+    ) +
+    geom_point(size = 2.7) +
+    geom_text(
+      aes(y = label_y, label = sprintf("%.4f", .data[[value]]), vjust = vjust),
+      size = 3.3,
+      color = "grey15"
+    ) +
+    geom_hline(yintercept = target, linetype = "dashed", color = "grey35") +
+    scale_color_manual(values = c(gOP = "#2A9D8F", RBC = "#E76F51")) +
+    theme_minimal(base_size = 15) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    ) +
+    labs(
+      title = title,
+      x = "Method_cell",
+      y = ylab,
+      color = "Method"
+    )
+}
+
+estimate_files <- list.files(
+  result_dir,
+  pattern = "^cell_probability_results.*\\.csv$",
+  full.names = TRUE,
+  recursive = isTRUE(params$recursive)
+)
+
+if (nzchar(params$file_filter)) {
+  estimate_files <- estimate_files[
+    grepl(params$file_filter, basename(estimate_files)) |
+      grepl(params$file_filter, estimate_files)
+  ]
+}
+
+estimate_files <- sort(estimate_files)
+
+truth_files <- list.files(
+  result_dir,
+  pattern = "^cell_probability_true_values.*\\.csv$",
+  full.names = TRUE,
+  recursive = isTRUE(params$recursive)
+)
+
+if (length(estimate_files) == 0) {
+  stop("No cell_probability_results*.csv files found in: ", result_dir, call. = FALSE)
+}
+
+set.seed(20260612)
+results <- lapply(estimate_files, function(file) {
+  truth_file <- truth_file_for(file, truth_files)
+  if (is.na(truth_file) || !file.exists(truth_file)) {
+    stop("Cannot find truth file for: ", basename(file), call. = FALSE)
+  }
+  summarize_one_file(file, truth_file, params$plot_sample_per_group)
+})
+
+names(results) <- vapply(results, `[[`, character(1), "label")
+
+all_summary <- do.call(
+  rbind,
+  lapply(results, function(x) x$summary)
+)
+rownames(all_summary) <- NULL
+
+write_summary_file <- function(summary_data) {
+  primary <- file.path(result_dir, "cell_probability_summary.csv")
+  fallback <- file.path(rmd_dir, "cell_probability_summary.csv")
+
+  for (file in unique(c(primary, fallback))) {
+    ok <- tryCatch({
+      write.csv(summary_data, file, row.names = FALSE)
+      TRUE
+    }, error = function(e) FALSE)
+
+    if (isTRUE(ok)) return(file)
+  }
+
+  warning(
+    "Could not write cell_probability_summary.csv. ",
+    "The summary is still shown in this report.",
+    call. = FALSE
+  )
+  NA_character_
+}
+
+summary_file <- write_summary_file(all_summary)
+```
+
+# Input Files
+
+```{r input-files}
+input_info <- do.call(
+  rbind,
+  lapply(results, function(x) {
+    data.frame(
+      scenario = x$label,
+      estimate_file = basename(x$file),
+      truth_file = basename(x$truth_file),
+      n_rows_used_for_summary = sum(x$summary$n_values),
+      n_zero_excluded = sum(x$summary$n_zero_excluded),
+      plot_sample_per_group = params$plot_sample_per_group,
+      row.names = NULL
+    )
+  })
+)
+
+knitr::kable(input_info)
+```
+
+# Summary
+
+The table below is calculated on the probability scale. Coverage is not shown because the simulation output currently saves point estimates of cell probabilities, but not cell-probability confidence intervals.
+
+```{r summary-table}
+display_summary <- all_summary[
+  order(all_summary$scenario, all_summary$cell, all_summary$method),
+  c(
+    "scenario", "dgm", "param_set", "n", "method", "cell",
+    "n_total", "n_zero_excluded", "n_values",
+    "mean_true", "mean_est", "bias", "mae", "rmse",
+    "mcsd_error", "q025_error", "q500_error", "q975_error"
+  )
+]
+
+knitr::kable(display_summary, digits = 4)
+```
+
+The same summary table is also written to:
+
+```{r summary-file}
+if (is.na(summary_file)) {
+  "The summary CSV could not be written from this R session."
+} else {
+  summary_file
+}
+```
+
+# Scenario Figures
+
+```{r scenario-figures, results='asis'}
+for (result in results) {
+  cat("\n\n## ", result$label, "\n\n", sep = "")
+
+  cat("\n\n### Cell Probability Summary\n\n")
+  print(knitr::kable(result$summary[
+    order(result$summary$cell, result$summary$method),
+    c(
+      "method", "cell", "n_total", "n_zero_excluded", "n_values",
+      "mean_true", "mean_est",
+      "bias", "mae", "rmse", "mcsd_error",
+      "q025_error", "q500_error", "q975_error"
+    )
+  ], digits = 4))
+
+  cat("\n\n### Estimation Error\n\n")
+  print(plot_error_boxplot(result))
+
+  cat("\n\n### Estimated Probabilities\n\n")
+  print(plot_estimate_boxplot(result))
+
+  cat("\n\n### RMSE\n\n")
+  print(plot_lollipop(
+    result,
+    value = "rmse",
+    target = 0,
+    title = paste0("RMSE of cell probability estimates (", result$label, ")"),
+    ylab = "RMSE"
+  ))
+
+  cat("\n\n### Bias\n\n")
+  print(plot_lollipop(
+    result,
+    value = "bias",
+    target = 0,
+    title = paste0("Bias of cell probability estimates (", result$label, ")"),
+    ylab = "Bias"
+  ))
+
+  cat("\n\n### Estimated Versus True\n\n")
+  print(plot_scatter(result))
+}
+```

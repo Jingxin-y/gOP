@@ -1,0 +1,464 @@
+---
+title: "Simulation Measures Results"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+params:
+  result_dir: "simulation_output_parallel"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+```{r functions}
+rmd_dir <- dirname(normalizePath(knitr::current_input(), winslash = "/", mustWork = TRUE))
+result_dir <- params$result_dir
+
+if (!dir.exists(result_dir)) {
+  result_dir <- file.path(rmd_dir, params$result_dir)
+}
+
+contrast_name <- c(
+  p10_p00 = "RR",
+  p01_p00 = "OR0",
+  p11_p10 = "OR1"
+)
+
+method_order <- c(
+  "gOP_RR", "gOP_OR0", "gOP_OR1",
+  "RBC_RR", "RBC_OR0", "RBC_OR1"
+)
+
+get_first_value <- function(x, default = NA_real_) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(default)
+  x[1]
+}
+
+guess_n_from_file <- function(file) {
+  base <- basename(file)
+  m <- regexpr("n[0-9]+|_[0-9]+", base)
+  if (m < 0) return(NA_integer_)
+  raw <- regmatches(base, m)
+  as.integer(gsub("[^0-9]", "", raw))
+}
+
+get_true_beta <- function(measures, contrast) {
+  get_first_value(measures$true_log_effect[measures$contrast == contrast])
+}
+
+guess_param_set_from_scenario <- function(scenario) {
+  out <- sub("^n_?[0-9]+_?", "", scenario)
+  out <- sub("^[_-]+", "", out)
+  ifelse(nzchar(out), out, NA_character_)
+}
+
+read_one_measures <- function(file) {
+  measures <- read.csv(file)
+
+  if (!"n" %in% names(measures)) {
+    measures$n <- guess_n_from_file(file)
+  }
+  if (!"scenario" %in% names(measures)) {
+    measures$scenario <- sub("^measures_results_?", "", sub("\\.csv$", "", basename(file)))
+    measures$scenario[measures$scenario == ""] <- "default"
+  }
+  if (!"param_set" %in% names(measures)) {
+    measures$param_set <- guess_param_set_from_scenario(measures$scenario)
+  }
+  if (!"b0_true" %in% names(measures)) {
+    measures$b0_true <- get_true_beta(measures, "p10_p00")
+  }
+  if (!"b1_true" %in% names(measures)) {
+    measures$b1_true <- get_true_beta(measures, "p01_p00")
+  }
+  if (!"b2_true" %in% names(measures)) {
+    measures$b2_true <- get_true_beta(measures, "p11_p10")
+  }
+
+  measures$measure_name <- contrast_name[measures$contrast]
+  measures$method_measure <- paste(measures$method, measures$measure_name, sep = "_")
+  measures$method_measure <- factor(measures$method_measure, levels = method_order)
+  measures$measure_name <- factor(measures$measure_name, levels = c("RR", "OR0", "OR1"))
+
+  measures
+}
+
+scenario_label <- function(measures) {
+  param_set <- get_first_value(measures$param_set, default = NA_character_)
+  param_text <- if (!is.na(param_set) && nzchar(param_set)) {
+    paste0(", ", gsub("_", "", param_set))
+  } else {
+    ""
+  }
+
+  paste0(
+    "n=", get_first_value(measures$n),
+    param_text,
+    " (b0=", sprintf("%.2f", get_first_value(measures$b0_true)),
+    ", b1=", sprintf("%.2f", get_first_value(measures$b1_true)),
+    ", b2=", sprintf("%.2f", get_first_value(measures$b2_true)),
+    ")"
+  )
+}
+
+est.result <- function(df) {
+  est <- df$log_estimate
+  true <- unique(round(df$true_log_effect, 12))[1]
+  se <- df$se
+  mcsd <- sd(est, na.rm = TRUE)
+
+  data.frame(
+    n = get_first_value(df$n),
+    true = true,
+    mean_est = mean(est, na.rm = TRUE),
+    bias = mean(est, na.rm = TRUE) - true,
+    mean_se = mean(se, na.rm = TRUE),
+    mcsd = mcsd,
+    se_mcsd = mean(se, na.rm = TRUE) / mcsd,
+    coverage = mean(df$ci_low < true & df$ci_up > true, na.rm = TRUE)
+  )
+}
+
+summarize_measures <- function(measures) {
+  groups <- split(measures, measures$method_measure, drop = TRUE)
+
+  summary_log <- do.call(
+    rbind,
+    lapply(groups, function(df) {
+      data.frame(
+        method_measure = df$method_measure[1],
+        method = df$method[1],
+        contrast = df$contrast[1],
+        measure_name = df$measure_name[1],
+        est.result(df)
+      )
+    })
+  )
+
+  summary_log$method_measure <- factor(summary_log$method_measure, levels = method_order)
+  summary_log$measure_name <- factor(summary_log$measure_name, levels = c("RR", "OR0", "OR1"))
+  summary_log <- summary_log[order(summary_log$method_measure), ]
+  rownames(summary_log) <- NULL
+  summary_log
+}
+
+prepare_result <- function(file) {
+  measures <- read_one_measures(file)
+
+  list(
+    file = file,
+    label = scenario_label(measures),
+    data = measures,
+    summary = summarize_measures(measures)
+  )
+}
+
+show_input_table <- function(result) {
+  measures <- result$data
+  knitr::kable(
+    data.frame(
+      scenario = result$label,
+      param_set = get_first_value(measures$param_set, default = NA_character_),
+      measures_file = basename(result$file),
+      n_rows = nrow(measures),
+      n_sim = length(unique(measures$sim_id)),
+      methods = paste(sort(unique(measures$method)), collapse = ", ")
+    )
+  )
+}
+
+plot_estimates <- function(result) {
+  measures <- result$data
+  est_ylim <- c(-4, 4)
+
+  removed_est <- do.call(
+    rbind,
+    lapply(split(measures, measures$method_measure, drop = TRUE), function(df) {
+      data.frame(
+        method_measure = df$method_measure[1],
+        measure_name = df$measure_name[1],
+        n_hi = sum(!is.na(df$log_estimate) & df$log_estimate > est_ylim[2]),
+        n_lo = sum(!is.na(df$log_estimate) & df$log_estimate < est_ylim[1])
+      )
+    })
+  )
+
+  true_lines <- unique(measures[, c("measure_name", "true_log_effect")])
+  need_truncate <- any(removed_est$n_hi > 0 | removed_est$n_lo > 0)
+
+  p <- ggplot(measures, aes(x = method_measure, y = log_estimate, fill = method_measure)) +
+    geom_boxplot(color = "grey20", width = 0.8, outlier.size = 0.5, alpha = 0.9) +
+    geom_hline(
+      data = true_lines,
+      aes(yintercept = true_log_effect),
+      inherit.aes = FALSE,
+      linetype = "dashed",
+      color = "steelblue"
+    ) +
+    stat_summary(fun = mean, geom = "point", shape = 21, size = 1.5,
+                 fill = "white", color = "black") +
+    geom_text(
+      data = subset(removed_est, n_hi > 0),
+      aes(x = method_measure, y = est_ylim[2], label = n_hi),
+      inherit.aes = FALSE,
+      size = 4,
+      color = "blue"
+    ) +
+    geom_text(
+      data = subset(removed_est, n_lo > 0),
+      aes(x = method_measure, y = est_ylim[1], label = n_lo),
+      inherit.aes = FALSE,
+      size = 4,
+      color = "blue"
+    ) +
+    geom_point(
+      data = subset(removed_est, n_hi > 0),
+      aes(x = method_measure, y = est_ylim[2], size = n_hi),
+      inherit.aes = FALSE,
+      shape = 21,
+      fill = "red",
+      color = "red",
+      alpha = 0.55
+    ) +
+    geom_point(
+      data = subset(removed_est, n_lo > 0),
+      aes(x = method_measure, y = est_ylim[1], size = n_lo),
+      inherit.aes = FALSE,
+      shape = 21,
+      fill = "red",
+      color = "red",
+      alpha = 0.55
+    ) +
+    scale_size_area(max_size = 20) +
+    scale_x_discrete(drop = TRUE) +
+    facet_wrap(~ measure_name, scales = "free_x", nrow = 1) +
+    theme_minimal(base_size = 18) +
+    theme(
+      axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 16),
+      legend.position = "none"
+    ) +
+    labs(
+      title = paste0("Monte Carlo distributions of log-scale estimates (", result$label, ")"),
+      x = "Method_measure",
+      y = "Estimated log effect"
+    )
+
+  if (requireNamespace("ggsci", quietly = TRUE)) {
+    p <- p + ggsci::scale_fill_d3(palette = "category20")
+  }
+
+  if (need_truncate) {
+    p <- p + coord_cartesian(ylim = est_ylim)
+  }
+
+  p
+}
+
+plot_se <- function(result) {
+  measures <- result$data
+  se_ylim <- c(0, 4)
+
+  removed_se <- do.call(
+    rbind,
+    lapply(split(measures, measures$method_measure, drop = TRUE), function(df) {
+      data.frame(
+        method_measure = df$method_measure[1],
+        measure_name = df$measure_name[1],
+        removed = sum(is.na(df$se) | !is.finite(df$se) | df$se >= se_ylim[2])
+      )
+    })
+  )
+
+  se_plot <- measures[is.finite(measures$se), ]
+  need_truncate <- any(is.finite(measures$se) & measures$se > se_ylim[2])
+
+  p <- ggplot(se_plot, aes(x = method_measure, y = se, fill = method_measure)) +
+    geom_boxplot(color = "grey20", width = 0.8, outlier.size = 0.5, alpha = 0.9) +
+    stat_summary(fun = mean, geom = "point", shape = 21, size = 1.5,
+                 fill = "white", color = "black") +
+    geom_text(
+      data = subset(removed_se, removed > 0),
+      aes(x = method_measure, y = se_ylim[2], label = removed),
+      inherit.aes = FALSE,
+      size = 4,
+      color = "blue"
+    ) +
+    geom_point(
+      data = subset(removed_se, removed > 0),
+      aes(x = method_measure, y = se_ylim[2], size = removed),
+      inherit.aes = FALSE,
+      shape = 21,
+      fill = "red",
+      color = "red",
+      alpha = 0.55
+    ) +
+    scale_size_area(max_size = 20) +
+    scale_x_discrete(drop = TRUE) +
+    facet_wrap(~ measure_name, scales = "free_x", nrow = 1) +
+    theme_minimal(base_size = 18) +
+    theme(
+      axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 16),
+      legend.position = "none"
+    ) +
+    labs(
+      title = paste0("Monte Carlo distributions of standard errors (", result$label, ")"),
+      x = "Method_measure",
+      y = "Estimated SE"
+    )
+
+  if (requireNamespace("ggsci", quietly = TRUE)) {
+    p <- p + ggsci::scale_fill_d3(palette = "category20")
+  }
+
+  if (need_truncate) {
+    p <- p + coord_cartesian(ylim = se_ylim)
+  }
+
+  p
+}
+
+plot_lollipop <- function(result, value, target, title, ylab, truncate_ylim = NULL) {
+  df <- result$summary
+  df$dev <- abs(df[[value]] - target)
+  df$label_y <- ifelse(df[[value]] >= target, df[[value]] + 0.012, df[[value]] - 0.012)
+  df$vjust <- ifelse(df[[value]] >= target, 0, 1)
+
+  dynamic_ylim <- range(c(df$label_y, df[[value]], target), finite = TRUE)
+  dynamic_ylim <- c(dynamic_ylim[1] - 0.02, dynamic_ylim[2] + 0.02)
+
+  need_truncate <- !is.null(truncate_ylim) &&
+    any(is.finite(df[[value]]) &
+          (df[[value]] < truncate_ylim[1] | df[[value]] > truncate_ylim[2]))
+
+  ylim <- if (need_truncate) truncate_ylim else dynamic_ylim
+
+  ggplot(df, aes(x = method_measure, y = .data[[value]])) +
+    geom_segment(
+      aes(xend = method_measure, y = target, yend = .data[[value]], color = dev),
+      linewidth = 3,
+      lineend = "round"
+    ) +
+    geom_point(size = 3) +
+    geom_text(
+      aes(y = label_y, label = sprintf("%.3f", .data[[value]]), vjust = vjust),
+      size = 4
+    ) +
+    geom_hline(yintercept = target, linetype = "dashed") +
+    scale_x_discrete(limits = method_order, drop = FALSE) +
+    scale_color_gradient(low = "grey80", high = "red4") +
+    guides(color = "none") +
+    theme_minimal(base_size = 18) +
+    theme(
+      axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 16),
+      legend.position = "none"
+    ) +
+    labs(
+      title = title,
+      x = "Method_measure",
+      y = ylab
+    ) +
+    coord_cartesian(ylim = ylim, clip = "off")
+}
+
+measure_files <- list.files(
+  result_dir,
+  pattern = "^measures_results.*\\.csv$",
+  full.names = TRUE
+)
+measure_files <- measure_files[!grepl("analysis|summary", basename(measure_files))]
+measure_files <- sort(measure_files)
+
+results <- lapply(measure_files, prepare_result)
+names(results) <- vapply(results, `[[`, character(1), "label")
+all_summary <- do.call(
+  rbind,
+  lapply(results, function(x) {
+    cbind(scenario = x$label, file = basename(x$file), x$summary)
+  })
+)
+rownames(all_summary) <- NULL
+```
+
+# Available Scenarios
+
+The cell probabilities under same scenario are same across sample sizes:
+
+small_1: (0.06, 0.08, 0.10, 0.13)
+
+small_3: (0.08, 0.12, 0.16, 0.20)
+
+
+normal_1: (0.35, 0.43, 0.48, 0.56)
+
+normal_3: (0.40, 0.50, 0.60, 0.70)
+
+```{r scenarios}
+scenario_info <- do.call(
+  rbind,
+  lapply(results, function(x) {
+    data.frame(
+      scenario = x$label,
+      param_set = get_first_value(x$data$param_set, default = NA_character_),
+      file = basename(x$file),
+      n_rows = nrow(x$data),
+      n_sim = length(unique(x$data$sim_id)),
+      methods = paste(sort(unique(x$data$method)), collapse = ", ")
+    )
+  })
+)
+
+knitr::kable(scenario_info)
+```
+
+
+# Scenario Figures
+
+```{r scenario-figures, results='asis'}
+for (result in results) {
+  cat("\n\n## ", result$label, "\n\n", sep = "")
+  print(show_input_table(result))
+
+  cat("\n\n### Log-Scale Summary\n\n")
+  print(knitr::kable(result$summary, digits = 4))
+
+  cat("\n\n### Point Estimates\n\n")
+  print(plot_estimates(result))
+
+  cat("\n\n### Standard Errors\n\n")
+  print(plot_se(result))
+
+  cat("\n\n### SE / MCSD\n\n")
+  print(plot_lollipop(
+    result,
+    value = "se_mcsd",
+    target = 1,
+    title = paste0("Mean SE / Monte Carlo SD by method_measure (", result$label, ")"),
+    ylab = "Mean SE / MCSD",
+    truncate_ylim = c(0, 2)
+  ))
+
+  cat("\n\n### Coverage\n\n")
+  print(plot_lollipop(
+    result,
+    value = "coverage",
+    target = 0.95,
+    title = paste0("Empirical coverage rates of 95% confidence intervals (", result$label, ")"),
+    ylab = "Coverage rate"
+  ))
+}
+```
